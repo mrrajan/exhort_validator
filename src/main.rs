@@ -1,7 +1,12 @@
-use exhort_validator::get_pom_dependency_json;
+use exhort_validator::{pom_synk_response, exhort_response};
 
 #[tokio::main]
 async fn main(){
-    get_pom_dependency_json().await;
+    let snyk_token = "<token-here>";
+    println!("--------------------------------------------------------------------------------------------------------");
+    println!("{:?}",pom_synk_response(snyk_token).await);
+    println!("--------------------------------------------------------------------------------------------------------");
+    println!("{:?}",exhort_response(snyk_token).await);
+    println!("--------------------------------------------------------------------------------------------------------");
 }
 
