@@ -79,9 +79,15 @@ pub struct ExhortRecord {
     pub SOURCE: String,
     pub CVSS: String,
     pub SEVERITY: String,
+    pub TYPE: String,
 }
 
-pub async fn get_exhort_response(sbom_type: &str, file_path: &str, exhort_api: &str) -> Vec<ExhortRecord> {
+pub async fn get_exhort_response(
+    client: &reqwest::Client,
+    sbom_type: &str,
+    file_path: &str,
+    exhort_api: &str,
+) -> Vec<ExhortRecord> {
     info!("Exhort: Initiate process...");
     info!("Exhort API URL: {}", exhort_api);
     let mut file = File::open(file_path).await.expect("Error opening the file");
@@ -92,7 +98,7 @@ pub async fn get_exhort_response(sbom_type: &str, file_path: &str, exhort_api: &
     } else {
         "application/vnd.spdx+json"
     };
-    let response = reqwest::Client::new()
+    let response = client
         .post(exhort_api.to_owned())
         .header("Content-Type", content_type)
         .header("Accept", "application/json")
@@ -158,6 +164,7 @@ pub async fn write_exhort_result(exhort_response: ExhortResponse) -> Result<Vec<
                         SOURCE: issue.source.clone(),
                         CVSS: issue.cvss_score.to_string(),
                         SEVERITY: issue.severity.clone(),
+                        TYPE: "Direct".to_string(),
                     });
                 }
 
@@ -171,6 +178,7 @@ pub async fn write_exhort_result(exhort_response: ExhortResponse) -> Result<Vec<
                             SOURCE: issue.source.clone(),
                             CVSS: issue.cvss_score.to_string(),
                             SEVERITY: issue.severity.clone(),
+                            TYPE: "Transitive".to_string(),
                         });
                     }
                 }

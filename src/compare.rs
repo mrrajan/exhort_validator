@@ -74,11 +74,10 @@ fn normalize_exhort_data(exhort_data: &[ExhortRecord]) -> HashMap<String, HashMa
 }
 
 fn compare_osv_vs_tpa(osv_data: &[OSVHeader], tpa_data: &[TPAHeaders]) -> Result<(), Box<dyn Error>> {
-    info!("Starting comparison: OSV vs TPA (source=osv)...");
+    info!("Starting comparison: OSV vs TPA (all sources)...");
 
     let osv_normalized = normalize_osv_data(osv_data);
-    // Filter for OSV records
-    let tpa_normalized = normalize_tpa_data(tpa_data, Some("osv"));
+    let tpa_normalized = normalize_tpa_data(tpa_data, None);
 
     let mut all_records: HashSet<(String, String)> = HashSet::new();
 
@@ -96,34 +95,32 @@ fn compare_osv_vs_tpa(osv_data: &[OSVHeader], tpa_data: &[TPAHeaders]) -> Result
 
     let mut comparison_records = Vec::new();
 
-    for (purl, cve_id) in all_records {
-        let osv_cvss = osv_normalized
-            .get(&purl)
-            .and_then(|cves| cves.get(&cve_id))
-            .cloned()
-            .unwrap_or_default();
+    for (purl, cve_id) in &all_records {
+        let osv_entry = osv_normalized
+            .get(purl)
+            .and_then(|cves| cves.get(cve_id));
 
-        let tpa_cvss = tpa_normalized
-            .get(&purl)
-            .and_then(|cves| cves.get(&cve_id))
-            .cloned()
-            .unwrap_or_default();
+        let tpa_entry = tpa_normalized
+            .get(purl)
+            .and_then(|cves| cves.get(cve_id));
+
+        let in_osv = osv_entry.is_some();
+        let in_tpa = tpa_entry.is_some();
 
         let mut missing_in = Vec::new();
-        if osv_cvss.is_empty() {
+        if !in_osv {
             missing_in.push("OSV");
         }
-        if tpa_cvss.is_empty() {
+        if !in_tpa {
             missing_in.push("TPA");
         }
 
-        // Only add to report if missing in at least one source
         if !missing_in.is_empty() {
             comparison_records.push(OsvTpaComparisonRecord {
                 purl: purl.clone(),
                 cve_id: cve_id.clone(),
-                osv_cvss,
-                tpa_cvss,
+                osv_cvss: osv_entry.cloned().unwrap_or_default(),
+                tpa_cvss: tpa_entry.cloned().unwrap_or_default(),
                 missing_in: missing_in.join(", "),
             });
         }
@@ -157,24 +154,23 @@ fn compare_tpa_vs_exhort(tpa_data: &[TPAHeaders], exhort_data: &[ExhortRecord]) 
 
     let mut comparison_records = Vec::new();
 
-    for (purl, cve_id) in all_records {
-        let tpa_cvss = tpa_normalized
-            .get(&purl)
-            .and_then(|cves| cves.get(&cve_id))
-            .cloned()
-            .unwrap_or_default();
+    for (purl, cve_id) in &all_records {
+        let tpa_entry = tpa_normalized
+            .get(purl)
+            .and_then(|cves| cves.get(cve_id));
 
-        let exhort_cvss = exhort_normalized
-            .get(&purl)
-            .and_then(|cves| cves.get(&cve_id))
-            .cloned()
-            .unwrap_or_default();
+        let exhort_entry = exhort_normalized
+            .get(purl)
+            .and_then(|cves| cves.get(cve_id));
+
+        let in_tpa = tpa_entry.is_some();
+        let in_exhort = exhort_entry.is_some();
 
         let mut missing_in = Vec::new();
-        if tpa_cvss.is_empty() {
+        if !in_tpa {
             missing_in.push("TPA");
         }
-        if exhort_cvss.is_empty() {
+        if !in_exhort {
             missing_in.push("Exhort");
         }
 
@@ -182,8 +178,8 @@ fn compare_tpa_vs_exhort(tpa_data: &[TPAHeaders], exhort_data: &[ExhortRecord]) 
             comparison_records.push(TpaExhortComparisonRecord {
                 purl: purl.clone(),
                 cve_id: cve_id.clone(),
-                tpa_cvss,
-                exhort_cvss,
+                tpa_cvss: tpa_entry.cloned().unwrap_or_default(),
+                exhort_cvss: exhort_entry.cloned().unwrap_or_default(),
                 missing_in: missing_in.join(", "),
             });
         }

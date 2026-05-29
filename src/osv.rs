@@ -2,17 +2,18 @@ use crate::sbom_cdx;
 use chrono;
 use csv::Writer;
 use cvss::v3::Base;
-use cvss::v4::{score, Vector};
+use cvss::v4::Vector;
 use log::{error, info, warn};
-use reqwest::{Response, StatusCode};
-use serde::de::value;
+use reqwest::StatusCode;
 use serde_derive::{Deserialize, Serialize};
-use serde_json::{to_string_pretty, Value};
+use serde_json::to_string_pretty;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Vulnerability {
@@ -46,20 +47,54 @@ pub struct OsvQuerybatchResponse {
     results: Vec<OsvVulns>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct OsvVulns {
     #[serde(default)]
-    vulns: Vec<OsvVulnId>,
+    pub vulns: Vec<OsvVulnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Advisory summary from [querybatch](https://google.github.io/osv.dev/post-v1-querybatch/) (`id` + `modified` only).
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OsvVulnId {
-    id: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct OsvQueryPackage {
+    purl: String,
+}
+
+#[derive(Serialize, Debug)]
+struct OsvQueryItem {
+    package: OsvQueryPackage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_token: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct OsvQuerybatchRequest {
+    queries: Vec<OsvQueryItem>,
+}
+
+/// Max PURLs per querybatch request (conservative; OSV also paginates large result sets).
+pub const OSV_QUERYBATCH_CHUNK_SIZE: usize = 100;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct OsvQuerybatchRow {
+    pub PURL: String,
+    pub OSV_ID: String,
+    pub MODIFIED: String,
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct OSVAlias {
     #[serde(default)]
     aliases: Vec<String>,
+    #[serde(default)]
+    upstream: Vec<String>,
     #[serde(default)]
     severity: Vec<OSVSeverity>,
 }
@@ -67,6 +102,15 @@ pub struct OSVAlias {
 impl OSVAlias {
     pub fn get_alias(&self) -> &Vec<String> {
         &self.aliases
+    }
+
+    pub fn get_cve_ids(&self) -> Vec<&str> {
+        self.upstream
+            .iter()
+            .chain(self.aliases.iter())
+            .filter(|id| id.starts_with("CVE-"))
+            .map(|s| s.as_str())
+            .collect()
     }
 }
 
@@ -80,6 +124,10 @@ pub struct OSVSeverity {
 impl OsvQuerybatchResponse {
     pub fn iter_results(&self) -> impl Iterator<Item = &OsvVulns> {
         self.results.iter()
+    }
+
+    fn into_results(self) -> Vec<OsvVulns> {
+        self.results
     }
 }
 
@@ -128,6 +176,333 @@ pub struct OSVHeader {
     pub PURL: String,
     pub CVE_ID: String,
     pub CVSS: String,
+}
+
+fn build_osv_querybatch_request(purls: &[String], page_tokens: Option<&[Option<String>]>) -> OsvQuerybatchRequest {
+    OsvQuerybatchRequest {
+        queries: purls
+            .iter()
+            .enumerate()
+            .map(|(i, purl)| OsvQueryItem {
+                package: OsvQueryPackage {
+                    purl: purl.clone(),
+                },
+                page_token: page_tokens.and_then(|tokens| tokens.get(i).cloned()).flatten(),
+            })
+            .collect(),
+    }
+}
+
+/// Call OSV `/v1/querybatch` for all PURLs (chunked, with pagination). Result order matches input PURLs.
+pub async fn query_osv_batch(
+    client: &reqwest::Client,
+    semaphore: &Arc<Semaphore>,
+    purls: &[String],
+) -> Result<Vec<OsvVulns>, Box<dyn Error>> {
+    if purls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_chunks = (purls.len() + OSV_QUERYBATCH_CHUNK_SIZE - 1) / OSV_QUERYBATCH_CHUNK_SIZE;
+    info!("OSV querybatch: processing {} chunk(s) concurrently...", total_chunks);
+
+    let mut handles = Vec::with_capacity(total_chunks);
+    for chunk in purls.chunks(OSV_QUERYBATCH_CHUNK_SIZE) {
+        let client = client.clone();
+        let sem = Arc::clone(semaphore);
+        let owned_chunk: Vec<String> = chunk.to_vec();
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            query_osv_batch_chunk(&client, &owned_chunk).await.map_err(|e| e.to_string())
+        });
+        handles.push(handle);
+    }
+
+    let mut merged = Vec::with_capacity(purls.len());
+    let mut failed_chunks = 0u32;
+    for (idx, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok(chunk_results)) => merged.extend(chunk_results),
+            Ok(Err(e)) => {
+                error!("OSV querybatch chunk {} failed: {}", idx, e);
+                failed_chunks += 1;
+                let chunk_size = std::cmp::min(
+                    OSV_QUERYBATCH_CHUNK_SIZE,
+                    purls.len() - idx * OSV_QUERYBATCH_CHUNK_SIZE,
+                );
+                merged.extend(std::iter::repeat_with(OsvVulns::default).take(chunk_size));
+            }
+            Err(e) => {
+                error!("OSV querybatch chunk {} panicked: {}", idx, e);
+                failed_chunks += 1;
+                let chunk_size = std::cmp::min(
+                    OSV_QUERYBATCH_CHUNK_SIZE,
+                    purls.len() - idx * OSV_QUERYBATCH_CHUNK_SIZE,
+                );
+                merged.extend(std::iter::repeat_with(OsvVulns::default).take(chunk_size));
+            }
+        }
+    }
+    if failed_chunks > 0 {
+        warn!(
+            "OSV: {} of {} chunk(s) failed; results are partial",
+            failed_chunks, total_chunks
+        );
+    }
+    Ok(merged)
+}
+
+async fn query_osv_batch_chunk(
+    client: &reqwest::Client,
+    purls: &[String],
+) -> Result<Vec<OsvVulns>, Box<dyn Error>> {
+    let mut accumulated: Vec<OsvVulns> = vec![OsvVulns::default(); purls.len()];
+    let mut page_tokens: Vec<Option<String>> = vec![None; purls.len()];
+
+    loop {
+        let body = build_osv_querybatch_request(purls, Some(&page_tokens));
+        let response = post_osv_querybatch(client, &body).await?;
+
+        if response.results.len() != purls.len() {
+            return Err(format!(
+                "OSV querybatch returned {} results for {} queries",
+                response.results.len(),
+                purls.len()
+            )
+            .into());
+        }
+
+        let mut more_pages = false;
+        for (i, result) in response.into_results().into_iter().enumerate() {
+            accumulated[i].vulns.extend(result.vulns);
+            if let Some(token) = result.next_page_token {
+                page_tokens[i] = Some(token);
+                more_pages = true;
+            } else {
+                page_tokens[i] = None;
+            }
+        }
+
+        if !more_pages {
+            break;
+        }
+    }
+
+    Ok(accumulated)
+}
+
+async fn post_osv_querybatch(
+    client: &reqwest::Client,
+    body: &OsvQuerybatchRequest,
+) -> Result<OsvQuerybatchResponse, Box<dyn Error>> {
+    let response = client
+        .post("https://api.osv.dev/v1/querybatch")
+        .header("Accept", "application/json")
+        .json(body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("OSV querybatch failed ({status}): {text}").into());
+    }
+
+    Ok(response.json::<OsvQuerybatchResponse>().await?)
+}
+
+/// Resolve advisory IDs from querybatch into CVE-level records by calling `/v1/vulns/{id}`.
+/// Deduplicates advisory IDs first — each unique advisory is resolved once, then mapped to all PURLs.
+pub async fn resolve_advisories_to_cves(
+    client: &reqwest::Client,
+    semaphore: &Arc<Semaphore>,
+    by_purl: &HashMap<String, OsvVulns>,
+) -> Vec<OSVHeader> {
+    // Build mapping: advisory_id -> list of PURLs that reference it
+    let mut advisory_to_purls: HashMap<String, Vec<String>> = HashMap::new();
+    for (purl, result) in by_purl {
+        for vuln in &result.vulns {
+            advisory_to_purls
+                .entry(vuln.id.clone())
+                .or_default()
+                .push(purl.clone());
+        }
+    }
+
+    let total_entries: usize = advisory_to_purls.values().map(|v| v.len()).sum();
+    info!(
+        "OSV: resolving {} unique advisory(ies) to CVEs ({} total entries, {:.1}x dedup)...",
+        advisory_to_purls.len(),
+        total_entries,
+        total_entries as f64 / advisory_to_purls.len() as f64
+    );
+
+    // Resolve each unique advisory concurrently
+    let unique_ids: Vec<String> = advisory_to_purls.keys().cloned().collect();
+    let mut handles = Vec::with_capacity(unique_ids.len());
+    for advisory_id in &unique_ids {
+        let client = client.clone();
+        let sem = Arc::clone(semaphore);
+        let advisory_id = advisory_id.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let detail = get_osv_cve(&client, advisory_id.clone()).await;
+            (advisory_id, detail)
+        });
+        handles.push(handle);
+    }
+
+    // Collect resolved advisory details
+    let mut resolved: HashMap<String, OSVAlias> = HashMap::with_capacity(unique_ids.len());
+    for handle in handles {
+        match handle.await {
+            Ok((advisory_id, detail)) => {
+                resolved.insert(advisory_id, detail);
+            }
+            Err(e) => {
+                error!("OSV advisory resolution task panicked: {}", e);
+            }
+        }
+    }
+
+    info!(
+        "OSV: resolved {}/{} unique advisories, mapping to PURLs...",
+        resolved.len(),
+        unique_ids.len()
+    );
+
+    // Map resolved advisories back to all PURLs
+    let mut osv_headers: Vec<OSVHeader> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    for (advisory_id, purls) in &advisory_to_purls {
+        let detail = match resolved.get(advisory_id) {
+            Some(d) => d,
+            None => continue,
+        };
+        let cve_ids = detail.get_cve_ids();
+
+        let cvss_vector = detail
+            .severity
+            .iter()
+            .find(|s| s.score.contains("CVSS:3") || s.score.contains("CVSS:4"))
+            .map(|s| s.score.clone());
+
+        // Compute CVSS scores once per advisory (shared across PURLs)
+        let mut cve_scores: Vec<(String, String)> = Vec::new();
+        if cve_ids.is_empty() {
+            cve_scores.push((advisory_id.clone(), String::new()));
+        } else {
+            for cve_id in &cve_ids {
+                let score = match &cvss_vector {
+                    Some(vector) => get_cvss(vector.clone(), cve_id).await,
+                    None => String::new(),
+                };
+                cve_scores.push((cve_id.to_string(), score));
+            }
+        }
+
+        for purl in purls {
+            for (cve_id, score) in &cve_scores {
+                if !seen.insert((purl.clone(), cve_id.clone())) {
+                    continue;
+                }
+                osv_headers.push(OSVHeader {
+                    PURL: purl.clone(),
+                    CVE_ID: cve_id.clone(),
+                    CVSS: score.clone(),
+                });
+            }
+        }
+    }
+
+    osv_headers
+}
+
+/// Query OSV querybatch for all PURLs and write JSON + CSV under `test_results/source/`.
+pub async fn retrieve_osv_querybatch(
+    client: &reqwest::Client,
+    semaphore: &Arc<Semaphore>,
+    purls: Vec<String>,
+    sbom_type: &str,
+) -> Result<(HashMap<String, OsvVulns>, Vec<OSVHeader>), Box<dyn Error>> {
+    info!("OSV querybatch: querying {} package(s)...", purls.len());
+    let batch_results = query_osv_batch(client, semaphore, &purls).await?;
+
+    let mut by_purl: HashMap<String, OsvVulns> = HashMap::new();
+    for (purl, result) in purls.iter().zip(batch_results.iter()) {
+        by_purl.insert(purl.clone(), result.clone());
+    }
+
+    let now = chrono::offset::Local::now();
+    let timestamp = now.format("%Y%m%y_%H%M%S");
+
+    let json_path = format!(
+        "test_results/source/{}_osv_querybatch_{}.json",
+        sbom_type, timestamp
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&json_path)?;
+    file.write_all(to_string_pretty(&by_purl)?.as_bytes())?;
+
+    let csv_path = format!(
+        "test_results/source/{}_osv_querybatch_{}.csv",
+        sbom_type, timestamp
+    );
+    let mut wtr = Writer::from_path(&csv_path)?;
+    let mut rows: Vec<OsvQuerybatchRow> = Vec::new();
+    for (purl, result) in &by_purl {
+        if result.vulns.is_empty() {
+            rows.push(OsvQuerybatchRow {
+                PURL: purl.clone(),
+                OSV_ID: String::new(),
+                MODIFIED: String::new(),
+            });
+            continue;
+        }
+        for vuln in &result.vulns {
+            rows.push(OsvQuerybatchRow {
+                PURL: purl.clone(),
+                OSV_ID: vuln.id.clone(),
+                MODIFIED: vuln.modified.clone().unwrap_or_default(),
+            });
+        }
+    }
+    for row in &rows {
+        wtr.serialize(row)?;
+    }
+    wtr.flush()?;
+
+    info!(
+        "OSV querybatch: wrote {} ({} advisory row(s))",
+        json_path,
+        rows.len()
+    );
+
+    info!("OSV: resolving advisories to CVEs via /v1/vulns/...");
+    let osv_cve_headers = resolve_advisories_to_cves(client, semaphore, &by_purl).await;
+
+    let cve_csv_path = format!(
+        "test_results/source/{}_osv_cves_{}.csv",
+        sbom_type, timestamp
+    );
+    let mut cve_wtr = Writer::from_path(&cve_csv_path)?;
+    for row in &osv_cve_headers {
+        cve_wtr.serialize(row)?;
+    }
+    cve_wtr.flush()?;
+
+    info!(
+        "OSV: resolved {} CVE(s) from {} advisory(ies), wrote {}",
+        osv_cve_headers.len(),
+        rows.len(),
+        cve_csv_path
+    );
+
+    Ok((by_purl, osv_cve_headers))
 }
 
 pub async fn retrieve_sbom_osv_vulns(purls: Vec<String>, sbom_type: &str) -> Result<Vec<OSVHeader>, Box<dyn Error>> {
@@ -198,7 +573,8 @@ pub async fn get_osv_payload(purl: String) -> String {
 }
 
 pub async fn get_osv_response(purl: String) -> Option<Vec<Vulnerability>> {
-    let osv_response = retrieve_osv_ghsa(purl).await;
+    let client = reqwest::Client::new();
+    let osv_response = retrieve_osv_ghsa(&client, purl).await;
 
     if osv_response.results.is_empty() {
         return Some(Vec::new());
@@ -212,7 +588,7 @@ pub async fn get_osv_response(purl: String) -> Option<Vec<Vulnerability>> {
         }
 
         for ghsa in &osv_vuln.vulns {
-            let cves = get_osv_cve(ghsa.id.clone()).await;
+            let cves = get_osv_cve(&client, ghsa.id.clone()).await;
 
             if cves.aliases.is_empty() {
                 continue;
@@ -221,7 +597,7 @@ pub async fn get_osv_response(purl: String) -> Option<Vec<Vulnerability>> {
             let cvss_vector = cves
                 .severity
                 .iter()
-                .find(|cvss| (cvss.score.contains("CVSS:3") || cvss.score.contains("CVSS:4")))
+                .find(|cvss| cvss.score.contains("CVSS:3") || cvss.score.contains("CVSS:4"))
                 .map(|cvss| cvss.score.clone());
 
             for alias in &cves.aliases {
@@ -242,10 +618,10 @@ pub async fn get_osv_response(purl: String) -> Option<Vec<Vulnerability>> {
     Some(unique_vulns.into_iter().collect())
 }
 
-pub async fn retrieve_osv_ghsa(purl: String) -> OsvQuerybatchResponse {
-    let url = format!("https://api.osv.dev/v1/querybatch");
+pub async fn retrieve_osv_ghsa(client: &reqwest::Client, purl: String) -> OsvQuerybatchResponse {
+    let url = "https://api.osv.dev/v1/querybatch";
     let body = get_osv_payload(purl.clone());
-    let response = reqwest::Client::new()
+    let response = client
         .post(url)
         .header("Accept", "application/json")
         .body(body.await)
@@ -258,8 +634,8 @@ pub async fn retrieve_osv_ghsa(purl: String) -> OsvQuerybatchResponse {
     response
 }
 
-pub async fn get_json_response(url: String) -> serde_json::Value {
-    let response = reqwest::Client::new()
+pub async fn get_json_response(client: &reqwest::Client, url: String) -> serde_json::Value {
+    let response = client
         .get(url)
         .header("Accept", "application/json")
         .send()
@@ -267,32 +643,51 @@ pub async fn get_json_response(url: String) -> serde_json::Value {
         .unwrap();
     let status = response.status();
     let text_res = response.text().await.unwrap();
-    if !(status == StatusCode::OK) {
+    if status != StatusCode::OK {
         error!("NVD API failed with Error body: {}", text_res);
     }
     let json_response: serde_json::Value = serde_json::from_str(&text_res).expect("Failure");
     json_response
 }
 
-pub async fn get_osv_cve(ghsa_id: String) -> OSVAlias {
+pub async fn get_osv_cve(client: &reqwest::Client, ghsa_id: String) -> OSVAlias {
     let url = format!("https://api.osv.dev/v1/vulns/{}", ghsa_id);
-    let json_response = reqwest::Client::new()
-        .get(url)
+    let response = match client
+        .get(&url)
         .header("Accept", "application/json")
         .send()
         .await
-        .unwrap();
-    let status = json_response.status();
-    if !(status == StatusCode::OK) {
-        error!("NVD API failed with Error code: {}", status);
-    }
-    let osv_response = match json_response.json::<OSVAlias>().await {
-        Ok(json) => json,
-        Err(err) => {
-            panic!("Error parsing JSON response: {}", err);
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("OSV /v1/vulns/{} request failed: {}", ghsa_id, e);
+            return OSVAlias {
+                aliases: vec![],
+                upstream: vec![],
+                severity: vec![],
+            };
         }
     };
-    osv_response
+    let status = response.status();
+    if status != StatusCode::OK {
+        error!("OSV /v1/vulns/{} returned {}", ghsa_id, status);
+        return OSVAlias {
+            aliases: vec![],
+            upstream: vec![],
+            severity: vec![],
+        };
+    }
+    match response.json::<OSVAlias>().await {
+        Ok(json) => json,
+        Err(err) => {
+            error!("OSV /v1/vulns/{} parse error: {}", ghsa_id, err);
+            OSVAlias {
+                aliases: vec![],
+                upstream: vec![],
+                severity: vec![],
+            }
+        }
+    }
 }
 
 pub async fn get_cvss(vector: String, id: &str) -> String {

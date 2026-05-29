@@ -1,14 +1,22 @@
-use std::{collections::HashMap, error::Error};
+use std::collections::HashMap;
+use std::error::Error;
+use std::sync::Arc;
 
 use csv::Writer;
-use log::{error, info};
+use log::{error, info, warn};
 use reqwest;
 use reqwest::StatusCode;
 use serde_derive::{Deserialize, Serialize};
-use serde_json::{from_str, json, to_string_pretty};
+use serde_json::{from_str, to_string_pretty};
+use tokio::sync::Semaphore;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
-use crate::sbom_spdx::Package;
+/// PURLs per analyze request (keep modest to limit payload size).
+pub const TPA_CHUNK_SIZE: usize = 25;
+/// Max in-flight TPA analyze requests (1 = strictly serial).
+pub const TPA_CONCURRENCY: usize = 1;
+/// Pause between chunk requests when concurrency is 1 (ms).
+pub const TPA_CHUNK_DELAY_MS: u64 = 300;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Score {
@@ -65,39 +73,173 @@ pub struct TPAHeaders {
     pub Source: String,
 }
 
-pub async fn tpa_purl_vuln_analyze(tpa_base_url: &str, tpa_access_token: &str, purls: Vec<String>) -> Vec<TPAHeaders> {
-    info!("RHTPA: Initiate process...");
+fn is_purl_valid_for_tpa(purl: &str) -> bool {
+    let no_namespace_types = ["cargo", "golang", "pypi", "nuget", "gem"];
+    if let Some(rest) = purl.strip_prefix("pkg:") {
+        if let Some((type_and_path, _version)) = rest.split_once('@') {
+            let segments: Vec<&str> = type_and_path.splitn(3, '/').collect();
+            if segments.len() >= 3 {
+                let purl_type = segments[0];
+                if no_namespace_types.contains(&purl_type) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+pub async fn tpa_purl_vuln_analyze(
+    client: &reqwest::Client,
+    _semaphore: &Arc<Semaphore>,
+    tpa_base_url: &str,
+    tpa_access_token: Option<&str>,
+    purls: Vec<String>,
+) -> Vec<TPAHeaders> {
+    let original_count = purls.len();
+    let purls: Vec<String> = purls.into_iter().filter(|p| is_purl_valid_for_tpa(p)).collect();
+    let filtered = original_count - purls.len();
+    if filtered > 0 {
+        warn!(
+            "RHTPA: filtered out {} PURL(s) with invalid namespace for their type",
+            filtered
+        );
+    }
+
+    let total_chunks = (purls.len() + TPA_CHUNK_SIZE - 1) / TPA_CHUNK_SIZE;
+    info!(
+        "RHTPA: {} PURLs in {} chunk(s) of {} (max {} concurrent, {}ms between chunks)...",
+        purls.len(),
+        total_chunks,
+        TPA_CHUNK_SIZE,
+        TPA_CONCURRENCY,
+        TPA_CHUNK_DELAY_MS
+    );
     let tpa_analyze_endpoint = format!("{}/api/v2/vulnerability/analyze", tpa_base_url);
     info!("TPA Endpoint: {}", tpa_analyze_endpoint);
-    let content_body =
-        format! {"{{\"purls\":[{}]}}",purls.iter().map(|purl| format!("\"{}\"",purl)).collect::<Vec<_>>().join(",")};
-    let response = reqwest::Client::new()
-        .post(tpa_analyze_endpoint.to_owned())
-        .header("Content-Type", "application/json")
-        //.header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", tpa_access_token))
-        .body(content_body)
-        .send()
-        .await
-        .unwrap();
-    let status = response.status();
-    let text_response = response.text().await.unwrap();
-    if status == StatusCode::OK {
-        let tpa_response: TPAResponse = from_str(&text_response).expect("Error while parsing");
-        match write_tpa_result(tpa_response).await {
-            Ok(tpa_vulnerability) => tpa_vulnerability,
-            Err(e) => {
-                error!("Failed to write TPA result: {}", e);
+
+    if let Some(token) = tpa_access_token {
+        if token.is_empty() {
+            info!("RHTPA: No access token provided, calling API without authentication");
+        }
+    } else {
+        info!("RHTPA: No access token provided, calling API without authentication");
+    }
+
+    let tpa_sem = Arc::new(Semaphore::new(TPA_CONCURRENCY));
+    let delay = std::time::Duration::from_millis(TPA_CHUNK_DELAY_MS);
+    let mut all_headers: Vec<TPAHeaders> = Vec::new();
+
+    for (idx, chunk) in purls.chunks(TPA_CHUNK_SIZE).enumerate() {
+        if idx > 0 && TPA_CHUNK_DELAY_MS > 0 {
+            tokio::time::sleep(delay).await;
+        }
+        let _permit = tpa_sem.acquire().await.unwrap();
+        let chunk_headers = tpa_purl_vuln_analyze_chunk(
+            client,
+            &tpa_analyze_endpoint,
+            tpa_access_token,
+            chunk,
+        )
+        .await;
+        all_headers.extend(chunk_headers);
+
+        let done = idx + 1;
+        if done == 1 || done == total_chunks || done % 20 == 0 {
+            info!("RHTPA: progress {}/{} chunk(s)", done, total_chunks);
+        }
+    }
+
+    if !all_headers.is_empty() {
+        if let Err(e) = write_tpa_combined_csv(&all_headers) {
+            error!("Failed to write combined TPA CSV: {}", e);
+        }
+    }
+
+    info!("RHTPA: Retrieved {} total record(s)", all_headers.len());
+    all_headers
+}
+
+async fn tpa_purl_vuln_analyze_chunk(
+    client: &reqwest::Client,
+    endpoint: &str,
+    tpa_access_token: Option<&str>,
+    purls: &[String],
+) -> Vec<TPAHeaders> {
+    let content_body = format!(
+        "{{\"purls\":[{}]}}",
+        purls
+            .iter()
+            .map(|purl| format!("\"{}\"", purl))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let mut request = client
+        .post(endpoint)
+        .header("Content-Type", "application/json");
+
+    if let Some(token) = tpa_access_token.filter(|t| !t.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {}", token));
+    }
+
+    match request.body(content_body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let text_response = response.text().await.unwrap_or_default();
+            if status == StatusCode::OK {
+                let tpa_response: TPAResponse = match from_str(&text_response) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("TPA parse error for chunk: {}", e);
+                        return Vec::new();
+                    }
+                };
+                extract_tpa_headers(tpa_response)
+            } else {
+                error!("TPA chunk error: status={}, body={}", status, &text_response[..std::cmp::min(text_response.len(), 500)]);
                 Vec::new()
             }
         }
-    } else {
-        error!(
-            "Error Reaching to TPA: \nError code - {} \nResponse -  {}",
-            status, text_response
-        );
-        Vec::new()
+        Err(e) => {
+            error!("TPA chunk request failed: {}", e);
+            Vec::new()
+        }
     }
+}
+
+fn extract_tpa_headers(tpa_response: TPAResponse) -> Vec<TPAHeaders> {
+    let mut tpa_values: Vec<TPAHeaders> = Vec::new();
+    for (purl, package_details) in tpa_response.tpa_response {
+        for vuln in package_details.details {
+            for affected in vuln.status.affected {
+                for score in affected.scores {
+                    tpa_values.push(TPAHeaders {
+                        PURL: purl.to_string(),
+                        CVE_ID: vuln.identifier.to_string(),
+                        OSV_ID: affected.identifier.to_string(),
+                        CVSS: score.value.to_string(),
+                        CVSSType: score.cvssType.to_string(),
+                        Source: affected.labels.importerType.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    tpa_values
+}
+
+fn write_tpa_combined_csv(headers: &[TPAHeaders]) -> Result<(), Box<dyn Error>> {
+    let now: chrono::DateTime<chrono::Local> = chrono::offset::Local::now();
+    let timestamp = now.format("%Y%m%y_%H%M%S");
+    let csv_path = format!("test_results/source/tpa_response_{}.csv", timestamp);
+    let mut wtr = Writer::from_path(&csv_path)?;
+    for row in headers {
+        wtr.serialize(row)?;
+    }
+    wtr.flush()?;
+    info!("RHTPA: wrote combined CSV to {}", csv_path);
+    Ok(())
 }
 
 pub async fn write_tpa_result(tpa_response: TPAResponse) -> Result<Vec<TPAHeaders>, Box<dyn Error>> {
